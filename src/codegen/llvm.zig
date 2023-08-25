@@ -2354,10 +2354,10 @@ pub const Object = struct {
                 const name = try o.allocTypeName(ty);
                 defer gpa.free(name);
 
-                if (mod.typeToStruct(ty)) |struct_obj| {
-                    if (struct_obj.layout == .Packed and struct_obj.haveFieldTypes()) {
-                        assert(struct_obj.haveLayout());
-                        const info = struct_obj.backing_int_ty.intInfo(mod);
+                if (mod.typeToPackedStruct(ty)) |struct_type| {
+                    const backing_int_ty = struct_type.backingIntType(ip).*;
+                    if (backing_int_ty != .none) {
+                        const info = backing_int_ty.toType().intInfo(mod);
                         const dwarf_encoding: c_uint = switch (info.signedness) {
                             .signed => DW.ATE.signed,
                             .unsigned => DW.ATE.unsigned,
@@ -2439,10 +2439,8 @@ pub const Object = struct {
                         try o.di_type_map.put(gpa, ty.toIntern(), AnnotatedDITypePtr.initFull(full_di_ty));
                         return full_di_ty;
                     },
-                    .struct_type => |struct_type| s: {
-                        const struct_obj = mod.structPtrUnwrap(struct_type.index) orelse break :s;
-
-                        if (!struct_obj.haveFieldTypes()) {
+                    .struct_type => |struct_type| {
+                        if (!struct_type.haveFieldTypes(ip)) {
                             // This can happen if a struct type makes it all the way to
                             // flush() without ever being instantiated or referenced (even
                             // via pointer). The only reason we are hearing about it now is
@@ -3256,36 +3254,40 @@ pub const Object = struct {
                     const gop = try o.type_map.getOrPut(o.gpa, t.toIntern());
                     if (gop.found_existing) return gop.value_ptr.*;
 
-                    const struct_obj = mod.structPtrUnwrap(struct_type.index).?;
-                    if (struct_obj.layout == .Packed) {
-                        assert(struct_obj.haveLayout());
-                        const int_ty = try o.lowerType(struct_obj.backing_int_ty);
+                    if (struct_type.isPacked()) {
+                        const int_ty = try o.lowerType(struct_type.backingIntType(ip).toType());
                         gop.value_ptr.* = int_ty;
                         return int_ty;
                     }
 
                     const name = try o.builder.string(ip.stringToSlice(
-                        try struct_obj.getFullyQualifiedName(mod),
+                        try mod.declPtr(struct_type.decl).getFullyQualifiedName(mod),
                     ));
                     const ty = try o.builder.opaqueType(name);
                     gop.value_ptr.* = ty; // must be done before any recursive calls
 
-                    assert(struct_obj.haveFieldTypes());
+                    const fields = struct_type.fields(ip);
 
                     var llvm_field_types = std.ArrayListUnmanaged(Builder.Type){};
                     defer llvm_field_types.deinit(o.gpa);
-                    try llvm_field_types.ensureUnusedCapacity(o.gpa, struct_obj.fields.count());
+                    try llvm_field_types.ensureUnusedCapacity(o.gpa, fields.types.len);
 
                     comptime assert(struct_layout_version == 2);
                     var offset: u64 = 0;
                     var big_align: u32 = 1;
                     var struct_kind: Builder.Type.Structure.Kind = .normal;
 
-                    var it = struct_obj.runtimeFieldIterator(mod);
-                    while (it.next()) |field_and_index| {
-                        const field = field_and_index.field;
-                        const field_align = field.alignment(mod, struct_obj.layout);
-                        const field_ty_align = field.ty.abiAlignment(mod);
+                    for (struct_type.runtimeOrder(ip)) |runtime_index| {
+                        const field_index = runtime_index.toInt() orelse break;
+                        const field_ty = fields.types.get(ip)[field_index];
+                        const field_aligns = struct_type.field_aligns.get(ip);
+                        const field_align = mod.structFieldAlignment(
+                            mod,
+                            if (field_aligns.len == 0) .none else field_aligns[field_index],
+                            field_ty,
+                            struct_type.layout,
+                        );
+                        const field_ty_align = field_ty.abiAlignment(mod);
                         if (field_align < field_ty_align) struct_kind = .@"packed";
                         big_align = @max(big_align, field_align);
                         const prev_offset = offset;
@@ -3296,9 +3298,9 @@ pub const Object = struct {
                             o.gpa,
                             try o.builder.arrayType(padding_len, .i8),
                         );
-                        try llvm_field_types.append(o.gpa, try o.lowerType(field.ty));
+                        try llvm_field_types.append(o.gpa, try o.lowerType(field_ty));
 
-                        offset += field.ty.abiSize(mod);
+                        offset += field_ty.abiSize(mod);
                     }
                     {
                         const prev_offset = offset;
@@ -3928,22 +3930,21 @@ pub const Object = struct {
                         struct_ty, vals);
                 },
                 .struct_type => |struct_type| {
-                    const struct_obj = mod.structPtrUnwrap(struct_type.index).?;
-                    assert(struct_obj.haveLayout());
+                    assert(struct_type.haveLayout(ip));
                     const struct_ty = try o.lowerType(ty);
-                    if (struct_obj.layout == .Packed) {
+                    if (struct_type.layout == .Packed) {
                         comptime assert(Type.packed_struct_layout_version == 2);
                         var running_int = try o.builder.intConst(struct_ty, 0);
                         var running_bits: u16 = 0;
-                        for (struct_obj.fields.values(), 0..) |field, field_index| {
-                            if (!field.ty.hasRuntimeBitsIgnoreComptime(mod)) continue;
+                        for (struct_type.fields(ip).types.get(ip), 0..) |field_ty, field_index| {
+                            if (!field_ty.hasRuntimeBitsIgnoreComptime(mod)) continue;
 
                             const non_int_val =
                                 try o.lowerValue((try val.fieldValue(mod, field_index)).toIntern());
-                            const ty_bit_size: u16 = @intCast(field.ty.bitSize(mod));
+                            const ty_bit_size: u16 = @intCast(field_ty.bitSize(mod));
                             const small_int_ty = try o.builder.intType(ty_bit_size);
                             const small_int_val = try o.builder.castConst(
-                                if (field.ty.isPtrAtRuntime(mod)) .ptrtoint else .bitcast,
+                                if (field_ty.isPtrAtRuntime(mod)) .ptrtoint else .bitcast,
                                 non_int_val,
                                 small_int_ty,
                             );
@@ -3977,10 +3978,10 @@ pub const Object = struct {
                     var offset: u64 = 0;
                     var big_align: u32 = 0;
                     var need_unnamed = false;
-                    var field_it = struct_obj.runtimeFieldIterator(mod);
+                    var field_it = struct_type.runtimeFieldIterator(mod);
                     while (field_it.next()) |field_and_index| {
                         const field = field_and_index.field;
-                        const field_align = field.alignment(mod, struct_obj.layout);
+                        const field_align = field.alignment(mod, struct_type.layout);
                         big_align = @max(big_align, field_align);
                         const prev_offset = offset;
                         offset = std.mem.alignForward(u64, offset, field_align);
@@ -9559,6 +9560,7 @@ pub const FuncGen = struct {
     fn airAggregateInit(self: *FuncGen, inst: Air.Inst.Index) !Builder.Value {
         const o = self.dg.object;
         const mod = o.module;
+        const ip = &mod.intern_pool;
         const ty_pl = self.air.instructions.items(.data)[inst].ty_pl;
         const result_ty = self.typeOfIndex(inst);
         const len: usize = @intCast(result_ty.arrayLen(mod));
@@ -9576,23 +9578,22 @@ pub const FuncGen = struct {
                 return vector;
             },
             .Struct => {
-                if (result_ty.containerLayout(mod) == .Packed) {
-                    const struct_obj = mod.typeToStruct(result_ty).?;
-                    assert(struct_obj.haveLayout());
-                    const big_bits = struct_obj.backing_int_ty.bitSize(mod);
+                if (mod.typeToPackedStruct(result_ty)) |struct_type| {
+                    const backing_int_ty = struct_type.backingIntType(ip).*;
+                    assert(backing_int_ty != .none);
+                    const field_types = struct_type.fields(ip).types;
+                    const big_bits = backing_int_ty.toType().bitSize(mod);
                     const int_ty = try o.builder.intType(@intCast(big_bits));
-                    const fields = struct_obj.fields.values();
                     comptime assert(Type.packed_struct_layout_version == 2);
                     var running_int = try o.builder.intValue(int_ty, 0);
                     var running_bits: u16 = 0;
-                    for (elements, 0..) |elem, i| {
-                        const field = fields[i];
-                        if (!field.ty.hasRuntimeBitsIgnoreComptime(mod)) continue;
+                    for (elements, field_types) |elem, field_ty| {
+                        if (!field_ty.hasRuntimeBitsIgnoreComptime(mod)) continue;
 
                         const non_int_val = try self.resolveInst(elem);
-                        const ty_bit_size: u16 = @intCast(field.ty.bitSize(mod));
+                        const ty_bit_size: u16 = @intCast(field_ty.bitSize(mod));
                         const small_int_ty = try o.builder.intType(ty_bit_size);
-                        const small_int_val = if (field.ty.isPtrAtRuntime(mod))
+                        const small_int_val = if (field_ty.isPtrAtRuntime(mod))
                             try self.wip.cast(.ptrtoint, non_int_val, small_int_ty, "")
                         else
                             try self.wip.cast(.bitcast, non_int_val, small_int_ty, "");
@@ -9605,6 +9606,8 @@ pub const FuncGen = struct {
                     }
                     return running_int;
                 }
+
+                assert(result_ty.containerLayout(mod) != .Packed);
 
                 if (isByRef(result_ty, mod)) {
                     // TODO in debug builds init to undef so that the padding will be 0xaa
@@ -10577,15 +10580,16 @@ fn llvmField(ty: Type, field_index: usize, mod: *Module) ?LlvmField {
         .struct_type => |s| s,
         else => unreachable,
     };
-    const struct_obj = mod.structPtrUnwrap(struct_type.index).?;
-    const layout = struct_obj.layout;
-    assert(layout != .Packed);
+    assert(struct_type.layout != .Packed);
+
+    const field_types = struct_type.fields(ip).types.get(ip);
+    const field_aligns = struct_type.field_aligns.get(ip);
 
     var llvm_field_index: c_uint = 0;
-    var it = struct_obj.runtimeFieldIterator(mod);
-    while (it.next()) |field_and_index| {
-        const field = field_and_index.field;
-        const field_align = field.alignment(mod, layout);
+    for (struct_type.runtimeOrder(ip)) |opt_this_field_index| {
+        const this_field_index = opt_this_field_index.toInt() orelse break;
+        const field_ty = field_types[this_field_index];
+        const field_align = mod.structFieldAlignment(field_aligns[this_field_index], field_ty, struct_type.layout);
         big_align = @max(big_align, field_align);
         const prev_offset = offset;
         offset = std.mem.alignForward(u64, offset, field_align);
@@ -10595,20 +10599,20 @@ fn llvmField(ty: Type, field_index: usize, mod: *Module) ?LlvmField {
             llvm_field_index += 1;
         }
 
-        if (field_index == field_and_index.index) {
+        if (field_index == this_field_index) {
             return .{
                 .index = llvm_field_index,
-                .ty = field.ty,
+                .ty = field_ty,
                 .alignment = field_align,
             };
         }
 
         llvm_field_index += 1;
-        offset += field.ty.abiSize(mod);
-    } else {
-        // We did not find an llvm field that corresponds to this zig field.
-        return null;
+        offset += field_ty.abiSize(mod);
     }
+
+    // We did not find an llvm field that corresponds to this zig field.
+    return null;
 }
 
 fn firstParamSRet(fn_info: InternPool.Key.FuncType, mod: *Module) bool {

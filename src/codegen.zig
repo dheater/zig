@@ -474,20 +474,17 @@ pub fn generateSymbol(
                     }
                 }
             },
-            .struct_type => |struct_type| {
-                const struct_obj = mod.structPtrUnwrap(struct_type.index).?;
-
-                if (struct_obj.layout == .Packed) {
-                    const fields = struct_obj.fields.values();
+            .struct_type => |struct_type| switch (struct_type.layout) {
+                .Packed => {
                     const abi_size = math.cast(usize, typed_value.ty.abiSize(mod)) orelse
                         return error.Overflow;
                     const current_pos = code.items.len;
                     try code.resize(current_pos + abi_size);
                     var bits: u16 = 0;
 
-                    for (fields, 0..) |field, index| {
-                        const field_ty = field.ty;
+                    const field_types = struct_type.fields(ip).types;
 
+                    for (field_types, 0..) |field_ty, index| {
                         const field_val = switch (aggregate.storage) {
                             .bytes => |bytes| try ip.get(mod.gpa, .{ .int = .{
                                 .ty = field_ty.toIntern(),
@@ -516,14 +513,15 @@ pub fn generateSymbol(
                         }
                         bits += @as(u16, @intCast(field_ty.bitSize(mod)));
                     }
-                } else {
+                },
+                .Auto, .Extern => {
                     const struct_begin = code.items.len;
-                    const fields = struct_obj.fields.values();
+                    const field_types = struct_type.fields(ip).types;
 
                     var it = typed_value.ty.iterateStructOffsets(mod);
 
                     while (it.next()) |field_offset| {
-                        const field_ty = fields[field_offset.field].ty;
+                        const field_ty = field_types[field_offset.field].ty;
 
                         if (!field_ty.hasRuntimeBits(mod)) continue;
 
@@ -550,7 +548,7 @@ pub fn generateSymbol(
 
                     const padding = math.cast(usize, std.mem.alignForward(u64, it.offset, @max(it.big_align, 1)) - (code.items.len - struct_begin)) orelse return error.Overflow;
                     if (padding > 0) try code.appendNTimes(0, padding);
-                }
+                },
             },
             else => unreachable,
         },

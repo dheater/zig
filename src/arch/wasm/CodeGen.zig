@@ -991,6 +991,7 @@ fn addExtraAssumeCapacity(func: *CodeGen, extra: anytype) error{OutOfMemory}!u32
 /// Using a given `Type`, returns the corresponding type
 fn typeToValtype(ty: Type, mod: *Module) wasm.Valtype {
     const target = mod.getTarget();
+    const ip = &mod.intern_pool;
     return switch (ty.zigTypeTag(mod)) {
         .Float => switch (ty.floatBits(target)) {
             16 => wasm.Valtype.i32, // stored/loaded as u16
@@ -1005,12 +1006,12 @@ fn typeToValtype(ty: Type, mod: *Module) wasm.Valtype {
             if (info.bits > 32 and info.bits <= 128) break :blk wasm.Valtype.i64;
             break :blk wasm.Valtype.i32; // represented as pointer to stack
         },
-        .Struct => switch (ty.containerLayout(mod)) {
-            .Packed => {
-                const struct_obj = mod.typeToStruct(ty).?;
-                return typeToValtype(struct_obj.backing_int_ty, mod);
-            },
-            else => wasm.Valtype.i32,
+        .Struct => {
+            if (mod.typeToPackedStruct(ty)) |packed_struct| {
+                return typeToValtype(packed_struct.backingIntType(ip).toType(), mod);
+            } else {
+                return wasm.Valtype.i32;
+            }
         },
         .Vector => switch (determineSimdStoreStrategy(ty, mod)) {
             .direct => wasm.Valtype.v128,
@@ -1285,7 +1286,7 @@ fn genFunc(func: *CodeGen) InnerError!void {
         // store stack pointer so we can restore it when we return from the function
         try prologue.append(.{ .tag = .local_tee, .data = .{ .label = func.initial_stack_value.local.value } });
         // get the total stack size
-        const aligned_stack = std.mem.alignForward(u32, func.stack_size, func.stack_alignment);
+        const aligned_stack = mem.alignForward(u32, func.stack_size, func.stack_alignment);
         try prologue.append(.{ .tag = .i32_const, .data = .{ .imm32 = @as(i32, @intCast(aligned_stack)) } });
         // substract it from the current stack pointer
         try prologue.append(.{ .tag = .i32_sub, .data = .{ .tag = {} } });
@@ -1531,7 +1532,7 @@ fn allocStack(func: *CodeGen, ty: Type) !WValue {
         func.stack_alignment = abi_align;
     }
 
-    const offset = std.mem.alignForward(u32, func.stack_size, abi_align);
+    const offset = mem.alignForward(u32, func.stack_size, abi_align);
     defer func.stack_size = offset + abi_size;
 
     return WValue{ .stack_offset = .{ .value = offset, .references = 1 } };
@@ -1564,7 +1565,7 @@ fn allocStackPtr(func: *CodeGen, inst: Air.Inst.Index) !WValue {
         func.stack_alignment = abi_alignment;
     }
 
-    const offset = std.mem.alignForward(u32, func.stack_size, abi_alignment);
+    const offset = mem.alignForward(u32, func.stack_size, abi_alignment);
     defer func.stack_size = offset + abi_size;
 
     return WValue{ .stack_offset = .{ .value = offset, .references = 1 } };
@@ -1749,10 +1750,8 @@ fn isByRef(ty: Type, mod: *Module) bool {
             return ty.hasRuntimeBitsIgnoreComptime(mod);
         },
         .Struct => {
-            if (mod.typeToStruct(ty)) |struct_obj| {
-                if (struct_obj.layout == .Packed and struct_obj.haveFieldTypes()) {
-                    return isByRef(struct_obj.backing_int_ty, mod);
-                }
+            if (mod.typeToPackedStruct(ty)) |packed_struct| {
+                return isByRef(packed_struct.backingIntType(ip).toType(), mod);
             }
             return ty.hasRuntimeBitsIgnoreComptime(mod);
         },
@@ -3026,7 +3025,7 @@ fn lowerParentPtr(func: *CodeGen, ptr_val: Value, offset: u32) InnerError!WValue
                         if (layout.payload_align > layout.tag_align) break :blk 0;
 
                         // tag is stored first so calculate offset from where payload starts
-                        break :blk @as(u32, @intCast(std.mem.alignForward(u64, layout.tag_size, layout.tag_align)));
+                        break :blk @as(u32, @intCast(mem.alignForward(u64, layout.tag_size, layout.tag_align)));
                     },
                 },
                 .Pointer => switch (parent_ty.ptrSize(mod)) {
@@ -3103,8 +3102,12 @@ fn toTwosComplement(value: anytype, bits: u7) std.meta.Int(.unsigned, @typeInfo(
     return @as(WantedT, @intCast(result));
 }
 
+/// This function is intended to assert that `isByRef` returns `false` for `ty`.
+/// However such an assertion fails on the behavior tests currently.
 fn lowerConstant(func: *CodeGen, arg_val: Value, ty: Type) InnerError!WValue {
     const mod = func.bin_file.base.options.module.?;
+    // TODO: enable this assertion
+    //assert(!isByRef(ty, mod));
     const ip = &mod.intern_pool;
     var val = arg_val;
     switch (ip.indexToKey(val.ip_index)) {
@@ -3235,16 +3238,18 @@ fn lowerConstant(func: *CodeGen, arg_val: Value, ty: Type) InnerError!WValue {
                 val.writeToMemory(ty, mod, &buf) catch unreachable;
                 return func.storeSimdImmd(buf);
             },
-            .struct_type, .anon_struct_type => {
-                const struct_obj = mod.typeToStruct(ty).?;
-                assert(struct_obj.layout == .Packed);
+            .struct_type => |struct_type| {
+                // non-packed structs are not handled in this function because they
+                // are by-ref types.
+                assert(struct_type.layout == .Packed);
                 var buf: [8]u8 = .{0} ** 8; // zero the buffer so we do not read 0xaa as integer
-                val.writeToPackedMemory(ty, func.bin_file.base.options.module.?, &buf, 0) catch unreachable;
+                val.writeToPackedMemory(ty, mod, &buf, 0) catch unreachable;
+                const backing_int_ty = struct_type.backingIntType(ip).toType();
                 const int_val = try mod.intValue(
-                    struct_obj.backing_int_ty,
-                    std.mem.readIntLittle(u64, &buf),
+                    backing_int_ty,
+                    mem.readIntLittle(u64, &buf),
                 );
-                return func.lowerConstant(int_val, struct_obj.backing_int_ty);
+                return func.lowerConstant(int_val, backing_int_ty);
             },
             else => unreachable,
         },
@@ -3269,6 +3274,7 @@ fn storeSimdImmd(func: *CodeGen, value: [16]u8) !WValue {
 
 fn emitUndefined(func: *CodeGen, ty: Type) InnerError!WValue {
     const mod = func.bin_file.base.options.module.?;
+    const ip = &mod.intern_pool;
     switch (ty.zigTypeTag(mod)) {
         .Bool, .ErrorSet => return WValue{ .imm32 = 0xaaaaaaaa },
         .Int, .Enum => switch (ty.intInfo(mod).bits) {
@@ -3298,9 +3304,8 @@ fn emitUndefined(func: *CodeGen, ty: Type) InnerError!WValue {
             return WValue{ .imm32 = 0xaaaaaaaa };
         },
         .Struct => {
-            const struct_obj = mod.typeToStruct(ty).?;
-            assert(struct_obj.layout == .Packed);
-            return func.emitUndefined(struct_obj.backing_int_ty);
+            const packed_struct = mod.typeToPackedStruct(ty).?;
+            return func.emitUndefined(packed_struct.backingIntType(ip).toType());
         },
         else => return func.fail("Wasm TODO: emitUndefined for type: {}\n", .{ty.zigTypeTag(mod)}),
     }
@@ -3757,6 +3762,7 @@ fn structFieldPtr(
 
 fn airStructFieldVal(func: *CodeGen, inst: Air.Inst.Index) InnerError!void {
     const mod = func.bin_file.base.options.module.?;
+    const ip = &mod.intern_pool;
     const ty_pl = func.air.instructions.items(.data)[inst].ty_pl;
     const struct_field = func.air.extraData(Air.StructField, ty_pl.payload).data;
 
@@ -3769,9 +3775,9 @@ fn airStructFieldVal(func: *CodeGen, inst: Air.Inst.Index) InnerError!void {
     const result = switch (struct_ty.containerLayout(mod)) {
         .Packed => switch (struct_ty.zigTypeTag(mod)) {
             .Struct => result: {
-                const struct_obj = mod.typeToStruct(struct_ty).?;
-                const offset = struct_obj.packedFieldBitOffset(mod, field_index);
-                const backing_ty = struct_obj.backing_int_ty;
+                const packed_struct = mod.typeToPackedStruct(struct_ty).?;
+                const offset = mod.packedFieldBitOffset(packed_struct, field_index);
+                const backing_ty = packed_struct.backingIntType(ip).toType();
                 const wasm_bits = toWasmBits(backing_ty.intInfo(mod).bits) orelse {
                     return func.fail("TODO: airStructFieldVal for packed structs larger than 128 bits", .{});
                 };
@@ -3793,7 +3799,7 @@ fn airStructFieldVal(func: *CodeGen, inst: Air.Inst.Index) InnerError!void {
                     const truncated = try func.trunc(shifted_value, int_type, backing_ty);
                     const bitcasted = try func.bitcast(field_ty, int_type, truncated);
                     break :result try bitcasted.toLocal(func, field_ty);
-                } else if (field_ty.isPtrAtRuntime(mod) and struct_obj.fields.count() == 1) {
+                } else if (field_ty.isPtrAtRuntime(mod) and packed_struct.fieldsLen() == 1) {
                     // In this case we do not have to perform any transformations,
                     // we can simply reuse the operand.
                     break :result func.reuseOperand(struct_field.struct_operand, operand);
@@ -5065,7 +5071,7 @@ fn airShuffle(func: *CodeGen, inst: Air.Inst.Index) InnerError!void {
             std.wasm.simdOpcode(.i8x16_shuffle),
         } ++ [1]u32{undefined} ** 4;
 
-        var lanes = std.mem.asBytes(operands[1..]);
+        var lanes = mem.asBytes(operands[1..]);
         for (0..@as(usize, @intCast(mask_len))) |index| {
             const mask_elem = (try mask.elemValue(mod, index)).toSignedInt(mod);
             const base_index = if (mask_elem >= 0)
@@ -5099,6 +5105,7 @@ fn airReduce(func: *CodeGen, inst: Air.Inst.Index) InnerError!void {
 
 fn airAggregateInit(func: *CodeGen, inst: Air.Inst.Index) InnerError!void {
     const mod = func.bin_file.base.options.module.?;
+    const ip = &mod.intern_pool;
     const ty_pl = func.air.instructions.items(.data)[inst].ty_pl;
     const result_ty = func.typeOfIndex(inst);
     const len = @as(usize, @intCast(result_ty.arrayLen(mod)));
@@ -5150,13 +5157,13 @@ fn airAggregateInit(func: *CodeGen, inst: Air.Inst.Index) InnerError!void {
                     if (isByRef(result_ty, mod)) {
                         return func.fail("TODO: airAggregateInit for packed structs larger than 64 bits", .{});
                     }
-                    const struct_obj = mod.typeToStruct(result_ty).?;
-                    const fields = struct_obj.fields.values();
-                    const backing_type = struct_obj.backing_int_ty;
+                    const packed_struct = mod.typeToPackedStruct(result_ty).?;
+                    const field_types = packed_struct.fields(ip).types;
+                    const backing_type = packed_struct.backingIntType(ip).toType();
 
                     // ensure the result is zero'd
                     const result = try func.allocLocal(backing_type);
-                    if (struct_obj.backing_int_ty.bitSize(mod) <= 32)
+                    if (backing_type.bitSize(mod) <= 32)
                         try func.addImm32(0)
                     else
                         try func.addImm64(0);
@@ -5164,22 +5171,22 @@ fn airAggregateInit(func: *CodeGen, inst: Air.Inst.Index) InnerError!void {
 
                     var current_bit: u16 = 0;
                     for (elements, 0..) |elem, elem_index| {
-                        const field = fields[elem_index];
-                        if (!field.ty.hasRuntimeBitsIgnoreComptime(mod)) continue;
+                        const field_ty = field_types.get(ip)[elem_index];
+                        if (!field_ty.hasRuntimeBitsIgnoreComptime(mod)) continue;
 
-                        const shift_val = if (struct_obj.backing_int_ty.bitSize(mod) <= 32)
+                        const shift_val = if (backing_type.bitSize(mod) <= 32)
                             WValue{ .imm32 = current_bit }
                         else
                             WValue{ .imm64 = current_bit };
 
                         const value = try func.resolveInst(elem);
-                        const value_bit_size = @as(u16, @intCast(field.ty.bitSize(mod)));
+                        const value_bit_size: u16 = @intCast(field_ty.bitSize(mod));
                         const int_ty = try mod.intType(.unsigned, value_bit_size);
 
                         // load our current result on stack so we can perform all transformations
                         // using only stack values. Saving the cost of loads and stores.
                         try func.emitWValue(result);
-                        const bitcasted = try func.bitcast(int_ty, field.ty, value);
+                        const bitcasted = try func.bitcast(int_ty, field_ty, value);
                         const extended_val = try func.intcast(bitcasted, int_ty, backing_type);
                         // no need to shift any values when the current offset is 0
                         const shifted = if (current_bit != 0) shifted: {
@@ -5199,7 +5206,7 @@ fn airAggregateInit(func: *CodeGen, inst: Air.Inst.Index) InnerError!void {
                         if ((try result_ty.structFieldValueComptime(mod, elem_index)) != null) continue;
 
                         const elem_ty = result_ty.structFieldType(elem_index, mod);
-                        const elem_size = @as(u32, @intCast(elem_ty.abiSize(mod)));
+                        const elem_size: u32 = @intCast(elem_ty.abiSize(mod));
                         const value = try func.resolveInst(elem);
                         try func.store(offset, value, elem_ty, 0);
 

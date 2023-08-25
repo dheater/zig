@@ -1360,6 +1360,7 @@ pub const CType = extern union {
 
         pub fn initType(self: *@This(), ty: Type, kind: Kind, lookup: Lookup) !void {
             const mod = lookup.getModule();
+            const ip = &mod.intern_pool;
 
             self.* = undefined;
             if (!ty.isFnOrHasRuntimeBitsIgnoreComptime(mod))
@@ -1488,10 +1489,10 @@ pub const CType = extern union {
                 },
 
                 .Struct, .Union => |zig_ty_tag| if (ty.containerLayout(mod) == .Packed) {
-                    if (mod.typeToStruct(ty)) |struct_obj| {
-                        try self.initType(struct_obj.backing_int_ty, kind, lookup);
+                    if (mod.typeToPackedStruct(ty)) |packed_struct| {
+                        try self.initType(packed_struct.backingIntType(ip).toType(), kind, lookup);
                     } else {
-                        const bits = @as(u16, @intCast(ty.bitSize(mod)));
+                        const bits: u16 = @intCast(ty.bitSize(mod));
                         const int_ty = try mod.intType(.unsigned, bits);
                         try self.initType(int_ty, kind, lookup);
                     }
@@ -1722,7 +1723,6 @@ pub const CType = extern union {
 
                 .Fn => {
                     const info = mod.typeToFunc(ty).?;
-                    const ip = &mod.intern_pool;
                     if (!info.is_generic) {
                         if (lookup.isMutable()) {
                             const param_kind: Kind = switch (kind) {

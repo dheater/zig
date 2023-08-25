@@ -1354,9 +1354,8 @@ pub const DeclGen = struct {
                     else => unreachable,
                 };
 
-                const struct_obj = mod.structPtrUnwrap(struct_ty.index).?;
-                if (struct_obj.layout == .Packed) {
-                    return try self.resolveType(struct_obj.backing_int_ty, .direct);
+                if (struct_ty.layout == .Packed) {
+                    return try self.resolveType(struct_ty.backingIntType(ip).toType(), .direct);
                 }
 
                 var member_types = std.ArrayList(CacheRef).init(self.gpa);
@@ -1365,16 +1364,16 @@ pub const DeclGen = struct {
                 var member_names = std.ArrayList(CacheString).init(self.gpa);
                 defer member_names.deinit();
 
-                var it = struct_obj.runtimeFieldIterator(mod);
-                while (it.next()) |field_and_index| {
-                    const field = field_and_index.field;
-                    const index = field_and_index.index;
-                    const field_name = ip.stringToSlice(struct_obj.fields.keys()[index]);
-                    try member_types.append(try self.resolveType(field.ty, .indirect));
+                const fields = struct_ty.fields(ip);
+                for (struct_ty.runtimeOrder(ip)) |runtime_index| {
+                    const field_index = runtime_index.toInt() orelse break;
+                    const field_ty = fields.types.get(ip)[field_index];
+                    const field_name = ip.stringToSlice(fields.names.get(ip)[field_index]);
+                    try member_types.append(try self.resolveType(field_ty, .indirect));
                     try member_names.append(try self.spv.resolveString(field_name));
                 }
 
-                const name = ip.stringToSlice(try struct_obj.getFullyQualifiedName(self.module));
+                const name = ip.stringToSlice(try struct_ty.getFullyQualifiedName(self.module));
 
                 return try self.spv.resolve(.{ .struct_type = .{
                     .name = try self.spv.resolveString(name),

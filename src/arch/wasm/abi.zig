@@ -101,15 +101,11 @@ pub fn scalarType(ty: Type, mod: *Module) Type {
     const ip = &mod.intern_pool;
     switch (ty.zigTypeTag(mod)) {
         .Struct => {
-            switch (ty.containerLayout(mod)) {
-                .Packed => {
-                    const struct_obj = mod.typeToStruct(ty).?;
-                    return scalarType(struct_obj.backing_int_ty, mod);
-                },
-                else => {
-                    assert(ty.structFieldCount(mod) == 1);
-                    return scalarType(ty.structFieldType(0, mod), mod);
-                },
+            if (mod.typeToPackedStruct(ty)) |packed_struct| {
+                return scalarType(packed_struct.backingIntType(ip), mod);
+            } else {
+                assert(ty.structFieldCount(mod) == 1);
+                return scalarType(ty.structFieldType(0, mod), mod);
             }
         },
         .Union => {

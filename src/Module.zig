@@ -105,8 +105,6 @@ comptime_capture_scopes: std.AutoArrayHashMapUnmanaged(CaptureScope.Key, InternP
 
 /// To be eliminated in a future commit by moving more data into InternPool.
 /// Current uses that must be eliminated:
-/// * Struct comptime_args
-/// * Struct optimized_order
 /// * comptime pointer mutation
 /// This memory lives until the Module is destroyed.
 tmp_hack_arena: std.heap.ArenaAllocator,
@@ -678,14 +676,10 @@ pub const Decl = struct {
 
     /// If the Decl owns its value and it is a struct, return it,
     /// otherwise null.
-    pub fn getOwnedStruct(decl: Decl, mod: *Module) ?*Struct {
-        return mod.structPtrUnwrap(decl.getOwnedStructIndex(mod));
-    }
-
-    pub fn getOwnedStructIndex(decl: Decl, mod: *Module) Struct.OptionalIndex {
-        if (!decl.owns_tv) return .none;
-        if (decl.val.ip_index == .none) return .none;
-        return mod.intern_pool.indexToStructType(decl.val.toIntern());
+    pub fn getOwnedStruct(decl: Decl, mod: *Module) ?InternPool.Key.StructType {
+        if (!decl.owns_tv) return null;
+        if (decl.val.ip_index == .none) return null;
+        return mod.typeToStruct(decl.val.toType());
     }
 
     /// If the Decl owns its value and it is a union, return it,
@@ -804,218 +798,6 @@ pub const Decl = struct {
 /// This state is attached to every Decl when Module emit_h is non-null.
 pub const EmitH = struct {
     fwd_decl: ArrayListUnmanaged(u8) = .{},
-};
-
-pub const PropertyBoolean = enum { no, yes, unknown, wip };
-
-/// Represents the data that a struct declaration provides.
-pub const Struct = struct {
-    /// Set of field names in declaration order.
-    fields: Fields,
-    /// Represents the declarations inside this struct.
-    namespace: Namespace.Index,
-    /// The Decl that corresponds to the struct itself.
-    owner_decl: Decl.Index,
-    /// Index of the struct_decl ZIR instruction.
-    zir_index: Zir.Inst.Index,
-    /// Indexes into `fields` sorted to be most memory efficient.
-    optimized_order: ?[*]u32 = null,
-    layout: std.builtin.Type.ContainerLayout,
-    /// If the layout is not packed, this is the noreturn type.
-    /// If the layout is packed, this is the backing integer type of the packed struct.
-    /// Whether zig chooses this type or the user specifies it, it is stored here.
-    /// This will be set to the noreturn type until status is `have_layout`.
-    backing_int_ty: Type = Type.noreturn,
-    status: enum {
-        none,
-        field_types_wip,
-        have_field_types,
-        layout_wip,
-        have_layout,
-        fully_resolved_wip,
-        // The types and all its fields have had their layout resolved. Even through pointer,
-        // which `have_layout` does not ensure.
-        fully_resolved,
-    },
-    /// If true, has more than one possible value. However it may still be non-runtime type
-    /// if it is a comptime-only type.
-    /// If false, resolving the fields is necessary to determine whether the type has only
-    /// one possible value.
-    known_non_opv: bool,
-    requires_comptime: PropertyBoolean = .unknown,
-    have_field_inits: bool = false,
-    is_tuple: bool,
-    assumed_runtime_bits: bool = false,
-
-    pub const Index = enum(u32) {
-        _,
-
-        pub fn toOptional(i: Index) OptionalIndex {
-            return @as(OptionalIndex, @enumFromInt(@intFromEnum(i)));
-        }
-    };
-
-    pub const OptionalIndex = enum(u32) {
-        none = std.math.maxInt(u32),
-        _,
-
-        pub fn init(oi: ?Index) OptionalIndex {
-            return @as(OptionalIndex, @enumFromInt(@intFromEnum(oi orelse return .none)));
-        }
-
-        pub fn unwrap(oi: OptionalIndex) ?Index {
-            if (oi == .none) return null;
-            return @as(Index, @enumFromInt(@intFromEnum(oi)));
-        }
-    };
-
-    pub const Fields = std.AutoArrayHashMapUnmanaged(InternPool.NullTerminatedString, Field);
-
-    /// The `Type` and `Value` memory is owned by the arena of the Struct's owner_decl.
-    pub const Field = struct {
-        /// Uses `noreturn` to indicate `anytype`.
-        /// undefined until `status` is >= `have_field_types`.
-        ty: Type,
-        /// Uses `none` to indicate no default.
-        default_val: InternPool.Index,
-        /// Zero means to use the ABI alignment of the type.
-        abi_align: Alignment,
-        /// undefined until `status` is `have_layout`.
-        offset: u32,
-        /// If true then `default_val` is the comptime field value.
-        is_comptime: bool,
-
-        /// Returns the field alignment. If the struct is packed, returns 0.
-        /// Keep implementation in sync with `Sema.structFieldAlignment`.
-        pub fn alignment(
-            field: Field,
-            mod: *Module,
-            layout: std.builtin.Type.ContainerLayout,
-        ) u32 {
-            if (field.abi_align.toByteUnitsOptional()) |abi_align| {
-                assert(layout != .Packed);
-                return @as(u32, @intCast(abi_align));
-            }
-
-            const target = mod.getTarget();
-
-            switch (layout) {
-                .Packed => return 0,
-                .Auto => {
-                    if (target.ofmt == .c) {
-                        return alignmentExtern(field, mod);
-                    } else {
-                        return field.ty.abiAlignment(mod);
-                    }
-                },
-                .Extern => return alignmentExtern(field, mod),
-            }
-        }
-
-        pub fn alignmentExtern(field: Field, mod: *Module) u32 {
-            // This logic is duplicated in Type.abiAlignmentAdvanced.
-            const ty_abi_align = field.ty.abiAlignment(mod);
-
-            if (field.ty.isAbiInt(mod) and field.ty.intInfo(mod).bits >= 128) {
-                // The C ABI requires 128 bit integer fields of structs
-                // to be 16-bytes aligned.
-                return @max(ty_abi_align, 16);
-            }
-
-            return ty_abi_align;
-        }
-    };
-
-    /// Used in `optimized_order` to indicate field that is not present in the
-    /// runtime version of the struct.
-    pub const omitted_field = std.math.maxInt(u32);
-
-    pub fn getFullyQualifiedName(s: *Struct, mod: *Module) !InternPool.NullTerminatedString {
-        return mod.declPtr(s.owner_decl).getFullyQualifiedName(mod);
-    }
-
-    pub fn srcLoc(s: Struct, mod: *Module) SrcLoc {
-        return mod.declPtr(s.owner_decl).srcLoc(mod);
-    }
-
-    pub fn haveFieldTypes(s: Struct) bool {
-        return switch (s.status) {
-            .none,
-            .field_types_wip,
-            => false,
-            .have_field_types,
-            .layout_wip,
-            .have_layout,
-            .fully_resolved_wip,
-            .fully_resolved,
-            => true,
-        };
-    }
-
-    pub fn haveLayout(s: Struct) bool {
-        return switch (s.status) {
-            .none,
-            .field_types_wip,
-            .have_field_types,
-            .layout_wip,
-            => false,
-            .have_layout,
-            .fully_resolved_wip,
-            .fully_resolved,
-            => true,
-        };
-    }
-
-    pub fn packedFieldBitOffset(s: Struct, mod: *Module, index: usize) u16 {
-        assert(s.layout == .Packed);
-        assert(s.haveLayout());
-        var bit_sum: u64 = 0;
-        for (s.fields.values(), 0..) |field, i| {
-            if (i == index) {
-                return @as(u16, @intCast(bit_sum));
-            }
-            bit_sum += field.ty.bitSize(mod);
-        }
-        unreachable; // index out of bounds
-    }
-
-    pub const RuntimeFieldIterator = struct {
-        module: *Module,
-        struct_obj: *const Struct,
-        index: u32 = 0,
-
-        pub const FieldAndIndex = struct {
-            field: Field,
-            index: u32,
-        };
-
-        pub fn next(it: *RuntimeFieldIterator) ?FieldAndIndex {
-            const mod = it.module;
-            while (true) {
-                var i = it.index;
-                it.index += 1;
-                if (it.struct_obj.fields.count() <= i)
-                    return null;
-
-                if (it.struct_obj.optimized_order) |some| {
-                    i = some[i];
-                    if (i == Module.Struct.omitted_field) return null;
-                }
-                const field = it.struct_obj.fields.values()[i];
-
-                if (!field.is_comptime and field.ty.hasRuntimeBits(mod)) {
-                    return FieldAndIndex{ .index = i, .field = field };
-                }
-            }
-        }
-    };
-
-    pub fn runtimeFieldIterator(s: *const Struct, module: *Module) RuntimeFieldIterator {
-        return .{
-            .struct_obj = s,
-            .module = module,
-        };
-    }
 };
 
 pub const DeclAdapter = struct {
@@ -2893,18 +2675,8 @@ pub fn namespacePtr(mod: *Module, index: Namespace.Index) *Namespace {
     return mod.intern_pool.namespacePtr(index);
 }
 
-pub fn structPtr(mod: *Module, index: Struct.Index) *Struct {
-    return mod.intern_pool.structPtr(index);
-}
-
 pub fn namespacePtrUnwrap(mod: *Module, index: Namespace.OptionalIndex) ?*Namespace {
     return mod.namespacePtr(index.unwrap() orelse return null);
-}
-
-/// This one accepts an index from the InternPool and asserts that it is not
-/// the anonymous empty struct type.
-pub fn structPtrUnwrap(mod: *Module, index: Struct.OptionalIndex) ?*Struct {
-    return mod.structPtr(index.unwrap() orelse return null);
 }
 
 /// Returns true if and only if the Decl is the top level struct associated with a File.
@@ -4057,12 +3829,9 @@ fn semaDecl(mod: *Module, decl_index: Decl.Index) !bool {
 
     if (mod.declIsRoot(decl_index)) {
         const main_struct_inst = Zir.main_struct_inst;
-        const struct_index = decl.getOwnedStructIndex(mod).unwrap().?;
-        const struct_obj = mod.structPtr(struct_index);
-        // This might not have gotten set in `semaFile` if the first time had
-        // a ZIR failure, so we set it here in case.
-        struct_obj.zir_index = main_struct_inst;
-        try sema.analyzeStructDecl(decl, main_struct_inst, struct_index);
+        const struct_type = decl.getOwnedStruct(mod).?;
+        assert(struct_type.zir_index == main_struct_inst);
+        try sema.analyzeStructDecl(decl, main_struct_inst, struct_type);
         decl.analysis = .complete;
         decl.generation = mod.generation;
         return false;
@@ -5239,14 +5008,6 @@ pub fn createNamespace(mod: *Module, initialization: Namespace) !Namespace.Index
 
 pub fn destroyNamespace(mod: *Module, index: Namespace.Index) void {
     return mod.intern_pool.destroyNamespace(mod.gpa, index);
-}
-
-pub fn createStruct(mod: *Module, initialization: Struct) Allocator.Error!Struct.Index {
-    return mod.intern_pool.createStruct(mod.gpa, initialization);
-}
-
-pub fn destroyStruct(mod: *Module, index: Struct.Index) void {
-    return mod.intern_pool.destroyStruct(mod.gpa, index);
 }
 
 pub fn allocateNewDecl(
@@ -6639,20 +6400,30 @@ pub fn namespaceDeclIndex(mod: *Module, namespace_index: Namespace.Index) Decl.I
 /// * `@TypeOf(.{})`
 /// * A struct which has no fields (`struct {}`).
 /// * Not a struct.
-pub fn typeToStruct(mod: *Module, ty: Type) ?*Struct {
+pub fn typeToStruct(mod: *Module, ty: Type) ?InternPool.Key.StructType {
     if (ty.ip_index == .none) return null;
-    const struct_index = mod.intern_pool.indexToStructType(ty.toIntern()).unwrap() orelse return null;
-    return mod.structPtr(struct_index);
+    return switch (mod.intern_pool.indexToKey(ty.ip_index)) {
+        .struct_type => |t| t,
+        else => null,
+    };
+}
+
+pub fn typeToPackedStruct(mod: *Module, ty: Type) ?InternPool.Key.StructType {
+    if (ty.ip_index == .none) return null;
+    return switch (mod.intern_pool.indexToKey(ty.ip_index)) {
+        .struct_type => |t| if (t.layout == .Packed) t else null,
+        else => null,
+    };
 }
 
 /// This asserts that the union's enum tag type has been resolved.
 pub fn typeToUnion(mod: *Module, ty: Type) ?InternPool.UnionType {
     if (ty.ip_index == .none) return null;
     const ip = &mod.intern_pool;
-    switch (ip.indexToKey(ty.ip_index)) {
-        .union_type => |k| return ip.loadUnionType(k),
-        else => return null,
-    }
+    return switch (ip.indexToKey(ty.ip_index)) {
+        .union_type => |k| ip.loadUnionType(k),
+        else => null,
+    };
 }
 
 pub fn typeToFunc(mod: *Module, ty: Type) ?InternPool.Key.FuncType {
@@ -6865,4 +6636,43 @@ pub fn unionTagFieldIndex(mod: *Module, u: InternPool.UnionType, enum_tag: Value
     assert(ip.typeOf(enum_tag.toIntern()) == u.enum_tag_ty);
     const enum_type = ip.indexToKey(u.enum_tag_ty).enum_type;
     return enum_type.tagValueIndex(ip, enum_tag.toIntern());
+}
+
+/// Returns the field alignment of a non-packed struct in byte units.
+/// Keep implementation in sync with `Sema.structFieldAlignment`.
+/// asserts the layout is not packed.
+pub fn structFieldAlignment(
+    mod: *Module,
+    explicit_alignment: InternPool.Alignment,
+    field_ty: Type,
+    layout: std.builtin.Type.ContainerLayout,
+) u64 {
+    assert(layout != .Packed);
+    if (explicit_alignment.toByteUnitsOptional()) |a| return a;
+    const target = mod.getTarget();
+    switch (layout) {
+        .Packed => unreachable,
+        .Auto => {
+            if (target.ofmt == .c) {
+                return structFieldAlignmentExtern(mod, field_ty);
+            } else {
+                return field_ty.abiAlignment(mod);
+            }
+        },
+        .Extern => return structFieldAlignmentExtern(mod, field_ty),
+    }
+}
+
+/// Returns the field alignment of an extern struct in byte units.
+/// This logic is duplicated in Type.abiAlignmentAdvanced.
+pub fn structFieldAlignmentExtern(mod: *Module, field_ty: Type) u64 {
+    const ty_abi_align = field_ty.abiAlignment(mod);
+
+    if (field_ty.isAbiInt(mod) and field_ty.intInfo(mod).bits >= 128) {
+        // The C ABI requires 128 bit integer fields of structs
+        // to be 16-bytes aligned.
+        return @max(ty_abi_align, 16);
+    }
+
+    return ty_abi_align;
 }

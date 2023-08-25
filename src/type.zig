@@ -315,8 +315,8 @@ pub const Type = struct {
                 .generic_poison => unreachable,
             },
             .struct_type => |struct_type| {
-                if (mod.structPtrUnwrap(struct_type.index)) |struct_obj| {
-                    const decl = mod.declPtr(struct_obj.owner_decl);
+                if (struct_type.decl.unwrap()) |decl_index| {
+                    const decl = mod.declPtr(decl_index);
                     try decl.renderFullyQualifiedName(mod, writer);
                 } else if (struct_type.namespace.unwrap()) |namespace_index| {
                     const namespace = mod.namespacePtr(namespace_index);
@@ -563,24 +563,21 @@ pub const Type = struct {
                     .generic_poison => unreachable,
                 },
                 .struct_type => |struct_type| {
-                    const struct_obj = mod.structPtrUnwrap(struct_type.index) orelse {
-                        // This struct has no fields.
-                        return false;
-                    };
-                    if (struct_obj.status == .field_types_wip) {
+                    if (struct_type.assumeRuntimeBitsIfFieldTypesWip(ip)) {
                         // In this case, we guess that hasRuntimeBits() for this type is true,
                         // and then later if our guess was incorrect, we emit a compile error.
-                        struct_obj.assumed_runtime_bits = true;
                         return true;
                     }
                     switch (strat) {
                         .sema => |sema| _ = try sema.resolveTypeFields(ty),
-                        .eager => assert(struct_obj.haveFieldTypes()),
-                        .lazy => if (!struct_obj.haveFieldTypes()) return error.NeedLazy,
+                        .eager => assert(struct_type.haveFieldTypes(ip)),
+                        .lazy => if (!struct_type.haveFieldTypes(ip)) return error.NeedLazy,
                     }
-                    for (struct_obj.fields.values()) |field| {
-                        if (field.is_comptime) continue;
-                        if (try field.ty.hasRuntimeBitsAdvanced(mod, ignore_comptime_only, strat))
+                    const fields = struct_type.fields(ip);
+                    for (0..fields.types.len) |i| {
+                        if (struct_type.fieldIsComptime(ip, i)) continue;
+                        const field_ty = fields.types.get(ip)[i];
+                        if (try field_ty.hasRuntimeBitsAdvanced(mod, ignore_comptime_only, strat))
                             return true;
                     } else {
                         return false;
@@ -730,11 +727,8 @@ pub const Type = struct {
                 => false,
             },
             .struct_type => |struct_type| {
-                const struct_obj = mod.structPtrUnwrap(struct_type.index) orelse {
-                    // Struct with no fields has a well-defined layout of no bits.
-                    return true;
-                };
-                return struct_obj.layout != .Auto;
+                // Struct with no fields have a well-defined layout of no bits.
+                return struct_type.layout != .Auto or struct_type.hasNoFields(ip);
             },
             .union_type => |union_type| switch (union_type.flagsPtr(ip).runtime_tag) {
                 .none, .safety => union_type.flagsPtr(ip).layout != .Auto,
@@ -984,11 +978,26 @@ pub const Type = struct {
                     .generic_poison => unreachable,
                 },
                 .struct_type => |struct_type| {
-                    const struct_obj = mod.structPtrUnwrap(struct_type.index) orelse
+                    if (struct_type.isPacked()) {
+                        switch (strat) {
+                            .sema => |sema| try sema.resolveTypeLayout(ty),
+                            .lazy => if (struct_type.backing_int_ty == .none) return .{
+                                .val = (try mod.intern(.{ .int = .{
+                                    .ty = .comptime_int_type,
+                                    .storage = .{ .lazy_align = ty.toIntern() },
+                                } })).toValue(),
+                            },
+                            .eager => {},
+                        }
+                        assert(struct_type.backing_int_ty != .none);
+                        return .{ .scalar = struct_type.backing_int_ty.toType().abiAlignment(mod) };
+                    }
+
+                    if (struct_type.decl == .none)
                         return AbiAlignmentAdvanced{ .scalar = 0 };
 
                     if (opt_sema) |sema| {
-                        if (struct_obj.status == .field_types_wip) {
+                        if (struct_type.flagsPtr(ip).status == .field_types_wip) {
                             // We'll guess "pointer-aligned", if the struct has an
                             // underaligned pointer field then some allocations
                             // might require explicit alignment.
@@ -996,7 +1005,7 @@ pub const Type = struct {
                         }
                         _ = try sema.resolveTypeFields(ty);
                     }
-                    if (!struct_obj.haveFieldTypes()) switch (strat) {
+                    if (!struct_type.haveFieldTypes(ip)) switch (strat) {
                         .eager => unreachable, // struct layout not resolved
                         .sema => unreachable, // handled above
                         .lazy => return .{ .val = (try mod.intern(.{ .int = .{
@@ -1004,18 +1013,7 @@ pub const Type = struct {
                             .storage = .{ .lazy_align = ty.toIntern() },
                         } })).toValue() },
                     };
-                    if (struct_obj.layout == .Packed) {
-                        switch (strat) {
-                            .sema => |sema| try sema.resolveTypeLayout(ty),
-                            .lazy => if (!struct_obj.haveLayout()) return .{ .val = (try mod.intern(.{ .int = .{
-                                .ty = .comptime_int_type,
-                                .storage = .{ .lazy_align = ty.toIntern() },
-                            } })).toValue() },
-                            .eager => {},
-                        }
-                        assert(struct_obj.haveLayout());
-                        return AbiAlignmentAdvanced{ .scalar = struct_obj.backing_int_ty.abiAlignment(mod) };
-                    }
+                    assert(!struct_type.isPacked());
 
                     const fields = ty.structFields(mod);
                     var big_align: u32 = 0;
@@ -1043,7 +1041,7 @@ pub const Type = struct {
                         big_align = @max(big_align, field_align);
 
                         // This logic is duplicated in Module.Struct.Field.alignment.
-                        if (struct_obj.layout == .Extern or target.ofmt == .c) {
+                        if (struct_type.layout() == .Extern or target.ofmt == .c) {
                             if (field.ty.isAbiInt(mod) and field.ty.intInfo(mod).bits >= 128) {
                                 // The C ABI requires 128 bit integer fields of structs
                                 // to be 16-bytes aligned.
@@ -1437,41 +1435,43 @@ pub const Type = struct {
                     .noreturn => unreachable,
                     .generic_poison => unreachable,
                 },
-                .struct_type => |struct_type| switch (ty.containerLayout(mod)) {
-                    .Packed => {
-                        const struct_obj = mod.structPtrUnwrap(struct_type.index) orelse
-                            return AbiSizeAdvanced{ .scalar = 0 };
-
-                        switch (strat) {
-                            .sema => |sema| try sema.resolveTypeLayout(ty),
-                            .lazy => if (!struct_obj.haveLayout()) return .{ .val = (try mod.intern(.{ .int = .{
-                                .ty = .comptime_int_type,
-                                .storage = .{ .lazy_size = ty.toIntern() },
-                            } })).toValue() },
-                            .eager => {},
-                        }
-                        assert(struct_obj.haveLayout());
-                        return AbiSizeAdvanced{ .scalar = struct_obj.backing_int_ty.abiSize(mod) };
-                    },
-                    else => {
-                        switch (strat) {
-                            .sema => |sema| try sema.resolveTypeLayout(ty),
-                            .lazy => {
-                                const struct_obj = mod.structPtrUnwrap(struct_type.index) orelse
-                                    return AbiSizeAdvanced{ .scalar = 0 };
-                                if (!struct_obj.haveLayout()) return .{ .val = (try mod.intern(.{ .int = .{
-                                    .ty = .comptime_int_type,
-                                    .storage = .{ .lazy_size = ty.toIntern() },
-                                } })).toValue() };
+                .struct_type => |struct_type| {
+                    switch (strat) {
+                        .sema => |sema| try sema.resolveTypeLayout(ty),
+                        .lazy => switch (struct_type.layout) {
+                            .Packed => {
+                                if (struct_type.backingIntType(ip).* == .none) return .{
+                                    .val = (try mod.intern(.{ .int = .{
+                                        .ty = .comptime_int_type,
+                                        .storage = .{ .lazy_size = ty.toIntern() },
+                                    } })).toValue(),
+                                };
                             },
-                            .eager => {},
-                        }
-                        const field_count = ty.structFieldCount(mod);
-                        if (field_count == 0) {
-                            return AbiSizeAdvanced{ .scalar = 0 };
-                        }
-                        return AbiSizeAdvanced{ .scalar = ty.structFieldOffset(field_count, mod) };
-                    },
+                            .Auto, .Extern => {
+                                if (!struct_type.haveLayout(ip)) return .{
+                                    .val = (try mod.intern(.{ .int = .{
+                                        .ty = .comptime_int_type,
+                                        .storage = .{ .lazy_size = ty.toIntern() },
+                                    } })).toValue(),
+                                };
+                            },
+                        },
+                        .eager => {},
+                    }
+                    switch (struct_type.layout) {
+                        .Packed => {
+                            return .{
+                                .scalar = struct_type.backingIntType(ip).toType().abiSize(mod),
+                            };
+                        },
+                        .Auto, .Extern => {
+                            const field_count = ty.structFieldCount(mod);
+                            if (field_count == 0) {
+                                return .{ .scalar = 0 };
+                            }
+                            return .{ .scalar = ty.structFieldOffset(field_count, mod) };
+                        },
+                    }
                 },
                 .anon_struct_type => |tuple| {
                     switch (strat) {
@@ -1690,13 +1690,11 @@ pub const Type = struct {
                 .type_info => unreachable, // missing call to resolveTypeFields
             },
             .struct_type => |struct_type| {
-                const struct_obj = mod.structPtrUnwrap(struct_type.index) orelse return 0;
-                if (struct_obj.layout != .Packed) {
-                    return (try ty.abiSizeAdvanced(mod, strat)).scalar * 8;
+                if (struct_type.isPacked()) {
+                    if (opt_sema) |sema| _ = try sema.resolveTypeLayout(ty);
+                    return try struct_type.backingIntType(ip).*.toType().bitSizeAdvanced(mod, opt_sema);
                 }
-                if (opt_sema) |sema| _ = try sema.resolveTypeLayout(ty);
-                assert(struct_obj.haveLayout());
-                return try struct_obj.backing_int_ty.bitSizeAdvanced(mod, opt_sema);
+                return (try ty.abiSizeAdvanced(mod, strat)).scalar * 8;
             },
 
             .anon_struct_type => {
@@ -1751,13 +1749,7 @@ pub const Type = struct {
     pub fn layoutIsResolved(ty: Type, mod: *Module) bool {
         const ip = &mod.intern_pool;
         return switch (ip.indexToKey(ty.toIntern())) {
-            .struct_type => |struct_type| {
-                if (mod.structPtrUnwrap(struct_type.index)) |struct_obj| {
-                    return struct_obj.haveLayout();
-                } else {
-                    return true;
-                }
-            },
+            .struct_type => |struct_type| struct_type.haveLayout(ip),
             .union_type => |union_type| union_type.haveLayout(ip),
             .array_type => |array_type| {
                 if ((array_type.len + @intFromBool(array_type.sentinel != .none)) == 0) return true;
@@ -2022,10 +2014,7 @@ pub const Type = struct {
     pub fn containerLayout(ty: Type, mod: *Module) std.builtin.Type.ContainerLayout {
         const ip = &mod.intern_pool;
         return switch (ip.indexToKey(ty.toIntern())) {
-            .struct_type => |struct_type| {
-                const struct_obj = mod.structPtrUnwrap(struct_type.index) orelse return .Auto;
-                return struct_obj.layout;
-            },
+            .struct_type => |struct_type| struct_type.layout,
             .anon_struct_type => .Auto,
             .union_type => |union_type| union_type.flagsPtr(ip).layout,
             else => unreachable,
@@ -2138,10 +2127,6 @@ pub const Type = struct {
         return switch (ip.indexToKey(ty.toIntern())) {
             .vector_type => |vector_type| vector_type.len,
             .array_type => |array_type| array_type.len,
-            .struct_type => |struct_type| {
-                const struct_obj = ip.structPtrUnwrapConst(struct_type.index) orelse return 0;
-                return struct_obj.fields.count();
-            },
             .anon_struct_type => |tuple| tuple.types.len,
 
             else => unreachable,
@@ -2216,6 +2201,7 @@ pub const Type = struct {
 
     /// Asserts the type is an integer, enum, error set, or vector of one of them.
     pub fn intInfo(starting_ty: Type, mod: *Module) InternPool.Key.IntType {
+        const ip = &mod.intern_pool;
         const target = mod.getTarget();
         var ty = starting_ty;
 
@@ -2235,13 +2221,9 @@ pub const Type = struct {
             .c_ulong_type => return .{ .signedness = .unsigned, .bits = target.c_type_bit_size(.ulong) },
             .c_longlong_type => return .{ .signedness = .signed, .bits = target.c_type_bit_size(.longlong) },
             .c_ulonglong_type => return .{ .signedness = .unsigned, .bits = target.c_type_bit_size(.ulonglong) },
-            else => switch (mod.intern_pool.indexToKey(ty.toIntern())) {
+            else => switch (ip.indexToKey(ty.toIntern())) {
                 .int_type => |int_type| return int_type,
-                .struct_type => |struct_type| {
-                    const struct_obj = mod.structPtrUnwrap(struct_type.index).?;
-                    assert(struct_obj.layout == .Packed);
-                    ty = struct_obj.backing_int_ty;
-                },
+                .struct_type => |t| ty = t.backingIntType(ip).*.toType(),
                 .enum_type => |enum_type| ty = enum_type.tag_ty.toType(),
                 .vector_type => |vector_type| ty = vector_type.child.toType(),
 
@@ -2505,33 +2487,27 @@ pub const Type = struct {
                     .generic_poison => unreachable,
                 },
                 .struct_type => |struct_type| {
-                    if (mod.structPtrUnwrap(struct_type.index)) |s| {
-                        assert(s.haveFieldTypes());
-                        const field_vals = try mod.gpa.alloc(InternPool.Index, s.fields.count());
-                        defer mod.gpa.free(field_vals);
-                        for (field_vals, s.fields.values()) |*field_val, field| {
-                            if (field.is_comptime) {
-                                field_val.* = field.default_val;
-                                continue;
-                            }
-                            if (try field.ty.onePossibleValue(mod)) |field_opv| {
-                                field_val.* = try field_opv.intern(field.ty, mod);
-                            } else return null;
+                    assert(struct_type.haveFieldTypes(ip));
+                    if (struct_type.knownNonOpv(ip))
+                        return null;
+                    const field_vals = try mod.gpa.alloc(InternPool.Index, struct_type.fieldsLen(ip));
+                    defer mod.gpa.free(field_vals);
+                    for (field_vals, 0..) |*field_val, i| {
+                        if (struct_type.fieldIsComptime(ip, i)) {
+                            field_val.* = struct_type.fields(ip).values.get(ip)[i];
+                            continue;
                         }
-
-                        // In this case the struct has no runtime-known fields and
-                        // therefore has one possible value.
-                        return (try mod.intern(.{ .aggregate = .{
-                            .ty = ty.toIntern(),
-                            .storage = .{ .elems = field_vals },
-                        } })).toValue();
+                        const field_ty = struct_type.fields(ip).types.get(ip)[i];
+                        if (try field_ty.onePossibleValue(mod)) |field_opv| {
+                            field_val.* = try field_opv.intern(field_ty, mod);
+                        } else return null;
                     }
 
-                    // In this case the struct has no fields at all and
+                    // In this case the struct has no runtime-known fields and
                     // therefore has one possible value.
                     return (try mod.intern(.{ .aggregate = .{
                         .ty = ty.toIntern(),
-                        .storage = .{ .elems = &.{} },
+                        .storage = .{ .elems = field_vals },
                     } })).toValue();
                 },
 
@@ -2717,18 +2693,20 @@ pub const Type = struct {
                     => true,
                 },
                 .struct_type => |struct_type| {
+                    // packed structs cannot be comptime-only because they have a well-defined
+                    // memory layout and every field has a well-defined bit pattern.
+                    if (struct_type.layout == .Packed)
+                        return false;
+
                     // A struct with no fields is not comptime-only.
-                    const struct_obj = mod.structPtrUnwrap(struct_type.index) orelse return false;
-                    switch (struct_obj.requires_comptime) {
-                        .wip, .unknown => {
-                            // Return false to avoid incorrect dependency loops.
-                            // This will be handled correctly once merged with
-                            // `Sema.typeRequiresComptime`.
-                            return false;
-                        },
-                        .no => return false,
-                        .yes => return true,
-                    }
+                    return switch (struct_type.flagsPtr(ip).requires_comptime) {
+                        // Return false to avoid incorrect dependency loops.
+                        // This will be handled correctly once merged with
+                        // `Sema.typeRequiresComptime`.
+                        .wip, .unknown => false,
+                        .no => false,
+                        .yes => true,
+                    };
                 },
 
                 .anon_struct_type => |tuple| {
@@ -2984,37 +2962,19 @@ pub const Type = struct {
         return enum_type.tagValueIndex(ip, int_tag);
     }
 
-    pub fn structFields(ty: Type, mod: *Module) Module.Struct.Fields {
-        switch (mod.intern_pool.indexToKey(ty.toIntern())) {
-            .struct_type => |struct_type| {
-                const struct_obj = mod.structPtrUnwrap(struct_type.index) orelse return .{};
-                assert(struct_obj.haveFieldTypes());
-                return struct_obj.fields;
-            },
-            else => unreachable,
-        }
-    }
-
     pub fn structFieldName(ty: Type, field_index: usize, mod: *Module) InternPool.NullTerminatedString {
         const ip = &mod.intern_pool;
         return switch (ip.indexToKey(ty.toIntern())) {
-            .struct_type => |struct_type| {
-                const struct_obj = mod.structPtrUnwrap(struct_type.index).?;
-                assert(struct_obj.haveFieldTypes());
-                return struct_obj.fields.keys()[field_index];
-            },
+            .struct_type => |struct_type| struct_type.fields(ip).names.get(ip)[field_index],
             .anon_struct_type => |anon_struct| anon_struct.names.get(ip)[field_index],
             else => unreachable,
         };
     }
 
     pub fn structFieldCount(ty: Type, mod: *Module) usize {
-        return switch (mod.intern_pool.indexToKey(ty.toIntern())) {
-            .struct_type => |struct_type| {
-                const struct_obj = mod.structPtrUnwrap(struct_type.index) orelse return 0;
-                assert(struct_obj.haveFieldTypes());
-                return struct_obj.fields.count();
-            },
+        const ip = &mod.intern_pool;
+        return switch (ip.indexToKey(ty.toIntern())) {
+            .struct_type => |struct_type| struct_type.fieldsLen(ip),
             .anon_struct_type => |anon_struct| anon_struct.types.len,
             else => unreachable,
         };
@@ -3024,11 +2984,7 @@ pub const Type = struct {
     pub fn structFieldType(ty: Type, index: usize, mod: *Module) Type {
         const ip = &mod.intern_pool;
         return switch (ip.indexToKey(ty.toIntern())) {
-            .struct_type => |struct_type| {
-                const struct_obj = mod.structPtrUnwrap(struct_type.index).?;
-                assert(struct_obj.haveFieldTypes());
-                return struct_obj.fields.values()[index].ty;
-            },
+            .struct_type => |struct_type| struct_type.fields(ip).types.get(ip)[index],
             .union_type => |union_type| {
                 const union_obj = ip.loadUnionType(union_type);
                 return union_obj.field_types.get(ip)[index].toType();
@@ -3038,13 +2994,14 @@ pub const Type = struct {
         };
     }
 
-    pub fn structFieldAlign(ty: Type, index: usize, mod: *Module) u32 {
+    pub fn structFieldAlign(ty: Type, index: usize, mod: *Module) u64 {
         const ip = &mod.intern_pool;
         switch (ip.indexToKey(ty.toIntern())) {
             .struct_type => |struct_type| {
-                const struct_obj = mod.structPtrUnwrap(struct_type.index).?;
-                assert(struct_obj.layout != .Packed);
-                return struct_obj.fields.values()[index].alignment(mod, struct_obj.layout);
+                assert(struct_type.layout != .Packed);
+                const explicit_align = struct_type.field_aligns.get(ip)[index];
+                const field_ty = struct_type.fields(ip).types.get(ip)[index];
+                return mod.structFieldAlignment(explicit_align, field_ty, struct_type.layout);
             },
             .anon_struct_type => |anon_struct| {
                 return anon_struct.types.get(ip)[index].toType().abiAlignment(mod);
@@ -3061,8 +3018,7 @@ pub const Type = struct {
         const ip = &mod.intern_pool;
         switch (ip.indexToKey(ty.toIntern())) {
             .struct_type => |struct_type| {
-                const struct_obj = mod.structPtrUnwrap(struct_type.index).?;
-                const val = struct_obj.fields.values()[index].default_val;
+                const val = struct_type.fields(ip).values.get(ip)[index];
                 // TODO: avoid using `unreachable` to indicate this.
                 if (val == .none) return Value.@"unreachable";
                 return val.toValue();
@@ -3081,12 +3037,10 @@ pub const Type = struct {
         const ip = &mod.intern_pool;
         switch (ip.indexToKey(ty.toIntern())) {
             .struct_type => |struct_type| {
-                const struct_obj = mod.structPtrUnwrap(struct_type.index).?;
-                const field = struct_obj.fields.values()[index];
-                if (field.is_comptime) {
-                    return field.default_val.toValue();
+                if (struct_type.comptime_bits.getBit(ip, index)) {
+                    return struct_type.fields(ip).values.get(ip)[index].toValue();
                 } else {
-                    return field.ty.onePossibleValue(mod);
+                    return struct_type.fields(ip).types.get(ip)[index].toType().onePossibleValue(mod);
                 }
             },
             .anon_struct_type => |tuple| {
